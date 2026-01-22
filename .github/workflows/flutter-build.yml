@@ -168,6 +168,41 @@ jobs:
               cat "$_1"
               echo "======"
               echo ""
+      - name: Debug rendezvous definition locations
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          python3 - << 'PY'
+          from pathlib import Path
+          import re
+
+          repo = Path(".").resolve()
+          hits = []
+          for p in repo.rglob("*.rs"):
+              try:
+                  t = p.read_text(encoding="utf-8", errors="ignore")
+              except Exception:
+                  continue
+              if "RENDEZVOUS" not in t:
+                  continue
+
+              # pega linhas com RENDEZVOUS (limitado)
+              lines = []
+              for i, line in enumerate(t.splitlines(), start=1):
+                  if "RENDEZVOUS" in line:
+                      lines.append((i, line.strip()))
+              if lines:
+                  hits.append((p, lines[:8]))  # até 8 linhas por arquivo
+
+          print(f"Found {len(hits)} .rs files containing 'RENDEZVOUS':")
+          for p, lines in hits:
+              print("----", p.as_posix())
+              for ln, txt in lines:
+                  # reduz tamanho pra não poluir log
+                  txt = re.sub(r'\s+', ' ', txt)
+                  print(f"{ln}: {txt[:200]}")
+          PY
             done
             exit 1
           fi
