@@ -174,15 +174,55 @@ jobs:
           head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
         shell: bash
 
-      - name: Build rustdesk
+      - name: Patch RustDesk default server and key
+        shell: bash
         env:
           RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
           RS_PUB_KEY: ${{ secrets.RS_PUB_KEY }}
         run: |
-          # Windows: build RustDesk
+          python3 - << 'PY'
+          import os, re, pathlib, sys
+
+          server = os.environ.get("RENDEZVOUS_SERVER", "").strip()
+          key = os.environ.get("RS_PUB_KEY", "").strip()
+
+          if not server or not key:
+              print("❌ Missing secrets")
+              sys.exit(1)
+
+          path = pathlib.Path("libs/hbb_common/src/config.rs")
+          if not path.exists():
+              print("❌ config.rs not found:", path)
+              sys.exit(1)
+
+          text = path.read_text(encoding="utf-8", errors="ignore")
+          orig = text
+
+          text = re.sub(
+              r'(RENDEZVOUS[_A-Z]*SERVERS?\s*=\s*\[)[^\]]*(\]\s*;)',
+              rf'\1"{server}:21116"\2',
+              text
+          )
+
+          text = re.sub(
+              r'(RS_PUB_KEY\s*=\s*)".*?"\s*;',
+              rf'\1"{key}";',
+              text
+          )
+
+          if text == orig:
+              print("❌ Patch not applied — patterns not found")
+              sys.exit(1)
+
+          path.write_text(text, encoding="utf-8")
+          print("✅ RustDesk defaults patched")
+          PY
+
+      - name: Build rustdesk
+        shell: bash
+        run: |
           python3 .\build.py --portable --hwcodec --flutter --vram --skip-portable-pack
           mv ./flutter/build/windows/x64/runner/Release ./rustdesk
-
           # Download usbmmidd_v2.zip and extract it to ./rustdesk
           Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
           Expand-Archive usbmmidd_v2.zip -DestinationPath .
