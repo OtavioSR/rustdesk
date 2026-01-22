@@ -179,6 +179,7 @@ jobs:
         env:
           RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
           RS_PUB_KEY: ${{ secrets.RS_PUB_KEY }}
+          PYTHONUTF8: "1"
         run: |
           python3 - << 'PY'
           import os, re, pathlib, sys
@@ -187,23 +188,25 @@ jobs:
           key = os.environ.get("RS_PUB_KEY", "").strip()
 
           if not server or not key:
-              print("❌ Missing secrets")
+              print("Missing secrets RENDEZVOUS_SERVER or RS_PUB_KEY")
               sys.exit(1)
 
           path = pathlib.Path("libs/hbb_common/src/config.rs")
           if not path.exists():
-              print("❌ config.rs not found:", path)
+              print("config.rs not found:", path)
               sys.exit(1)
 
           text = path.read_text(encoding="utf-8", errors="ignore")
           orig = text
 
+          # Patch server list (adjusts something like RENDEZVOUS_SERVERS = ["x:21116"];)
           text = re.sub(
               r'(RENDEZVOUS[_A-Z]*SERVERS?\s*=\s*\[)[^\]]*(\]\s*;)',
               rf'\1"{server}:21116"\2',
               text
           )
 
+          # Patch pubkey (adjusts something like RS_PUB_KEY = "....";)
           text = re.sub(
               r'(RS_PUB_KEY\s*=\s*)".*?"\s*;',
               rf'\1"{key}";',
@@ -211,13 +214,12 @@ jobs:
           )
 
           if text == orig:
-              print("❌ Patch not applied — patterns not found")
+              print("Patch not applied: patterns not found in config.rs")
               sys.exit(1)
 
           path.write_text(text, encoding="utf-8")
-          print("✅ RustDesk defaults patched")
+          print("Patched defaults successfully")
           PY
-
       - name: Build rustdesk
         shell: bash
         run: |
