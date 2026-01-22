@@ -174,7 +174,7 @@ jobs:
           head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
         shell: bash
 
-      - name: Patch RustDesk default server and key
+      - name: Patch RustDesk default server and key (auto-detect)
         shell: bash
         env:
           RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
@@ -182,43 +182,102 @@ jobs:
           PYTHONUTF8: "1"
         run: |
           python3 - << 'PY'
-          import os, re, pathlib, sys
+          import os, re, sys
+          from pathlib import Path
 
-          server = os.environ.get("RENDEZVOUS_SERVER", "").strip()
-          key = os.environ.get("RS_PUB_KEY", "").strip()
+          server = (os.environ.get("RENDEZVOUS_SERVER") or "").strip()
+          key = (os.environ.get("RS_PUB_KEY") or "").strip()
 
           if not server or not key:
               print("Missing secrets RENDEZVOUS_SERVER or RS_PUB_KEY")
               sys.exit(1)
 
-          path = pathlib.Path("libs/hbb_common/src/config.rs")
-          if not path.exists():
-              print("config.rs not found:", path)
+          # Se o secret vier sem porta, assume 21116 (você pode trocar)
+          if ":" not in server:
+              server = f"{server}:21116"
+
+          repo = Path(".").resolve()
+
+          def find_files(pattern: str):
+              hits = []
+              for p in repo.rglob("*.rs"):
+                  try:
+                      t = p.read_text(encoding="utf-8", errors="ignore")
+                  except Exception:
+                      continue
+                  if pattern in t:
+                      hits.append(p)
+              return hits
+
+          rs_files = find_files("RS_PUB_KEY")
+          rdz_files = [p for p in find_files("RENDEZVOUS") if "target" not in str(p)]
+
+          if not rs_files:
+              print("Could not find RS_PUB_KEY in any .rs file")
               sys.exit(1)
 
-          text = path.read_text(encoding="utf-8", errors="ignore")
-          orig = text
-
-          # Patch server list (adjusts something like RENDEZVOUS_SERVERS = ["x:21116"];)
-          text = re.sub(
-              r'(RENDEZVOUS[_A-Z]*SERVERS?\s*=\s*\[)[^\]]*(\]\s*;)',
-              rf'\1"{server}:21116"\2',
-              text
-          )
-
-          # Patch pubkey (adjusts something like RS_PUB_KEY = "....";)
-          text = re.sub(
-              r'(RS_PUB_KEY\s*=\s*)".*?"\s*;',
-              rf'\1"{key}";',
-              text
-          )
-
-          if text == orig:
-              print("Patch not applied: patterns not found in config.rs")
+          if not rdz_files:
+              print("Could not find RENDEZVOUS in any .rs file")
               sys.exit(1)
 
-          path.write_text(text, encoding="utf-8")
-          print("Patched defaults successfully")
+          print("RS_PUB_KEY candidates:", len(rs_files))
+          print("RENDEZVOUS candidates:", len(rdz_files))
+
+          # Regexes mais amplas (cobrem pub const/static, com ou sem type)
+          pubkey_patterns = [
+              # RS_PUB_KEY = "....";
+              (re.compile(r'(RS_PUB_KEY\s*=\s*)"[^"]*"\s*;'), r'\1"' + key + r'";'),
+              # pub const RS_PUB_KEY: &str = "....";
+              (re.compile(r'(RS_PUB_KEY\s*:\s*&str\s*=\s*)"[^"]*"\s*;'), r'\1"' + key + r'";'),
+              # pub static ref RS_PUB_KEY: String = "....".to_string();
+              (re.compile(r'(RS_PUB_KEY[^\n=]*=\s*)"[^"]*"\s*(\.to_string\(\))?\s*;'), r'\1"' + key + r'"\2;'),
+          ]
+
+          # Rendezvous pode ser string simples, ou array de &str
+          rendezvous_patterns = [
+              # RENDEZVOUS_SERVER = "host:port";
+              (re.compile(r'(RENDEZVOUS[_A-Z]*SERVER\s*=\s*)"[^"]*"\s*;'), r'\1"' + server + r'";'),
+              # RENDEZVOUS_SERVERS = ["a:21116", "b:21116"];
+              (re.compile(r'(RENDEZVOUS[_A-Z]*SERVERS\s*=\s*\[)[^\]]*(\]\s*;)'), r'\1"' + server + r'"\2'),
+              # pub const RENDEZVOUS_SERVERS: [&str; N] = ["..."];
+              (re.compile(r'(RENDEZVOUS[_A-Z]*SERVERS[^\n=]*=\s*\[)[^\]]*(\]\s*;)'), r'\1"' + server + r'"\2'),
+          ]
+
+          def patch_file(path: Path, patterns):
+              text = path.read_text(encoding="utf-8", errors="ignore")
+              orig = text
+              for rx, repl in patterns:
+                  text = rx.sub(repl, text)
+              if text != orig:
+                  path.write_text(text, encoding="utf-8")
+                  return True
+              return False
+
+          changed = []
+
+          # Patch pubkey primeiro (normalmente 1 arquivo)
+          for p in rs_files:
+              if patch_file(p, pubkey_patterns):
+                  changed.append(("RS_PUB_KEY", p))
+
+          # Patch rendezvous (pode estar em outro arquivo)
+          for p in rdz_files:
+              if patch_file(p, rendezvous_patterns):
+                  changed.append(("RENDEZVOUS", p))
+
+          if not any(k == "RS_PUB_KEY" for k, _ in changed):
+              print("Patch failed: RS_PUB_KEY patterns did not match in any candidate file.")
+              print("Tip: open the file(s) listed above and check how RS_PUB_KEY is defined.")
+              sys.exit(1)
+
+          if not any(k == "RENDEZVOUS" for k, _ in changed):
+              print("Patch failed: RENDEZVOUS patterns did not match in any candidate file.")
+              print("Tip: open the file(s) listed above and check how rendezvous server(s) is defined.")
+              sys.exit(1)
+
+          print("Patched successfully:")
+          for kind, p in changed:
+              print(f" - {kind}: {p}")
           PY
       - name: Build rustdesk
         shell: bash
