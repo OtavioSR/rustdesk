@@ -147,13 +147,6 @@ jobs:
         with:
           prefix-key: ${{ matrix.job.os }}
 
-      - name: Setup vcpkg with Github Actions binary cache
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgDirectory: C:\vcpkg
-          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
-          doNotCache: false
-
       - name: Install vcpkg dependencies
         env:
           VCPKG_DEFAULT_HOST_TRIPLET: ${{ matrix.job.vcpkg-triplet }}
@@ -168,48 +161,13 @@ jobs:
               cat "$_1"
               echo "======"
               echo ""
-      - name: Debug rendezvous definition locations
-        shell: bash
-        env:
-          PYTHONUTF8: "1"
-        run: |
-          python3 - << 'PY'
-          from pathlib import Path
-          import re
-
-          repo = Path(".").resolve()
-          hits = []
-          for p in repo.rglob("*.rs"):
-              try:
-                  t = p.read_text(encoding="utf-8", errors="ignore")
-              except Exception:
-                  continue
-              if "RENDEZVOUS" not in t:
-                  continue
-
-              # pega linhas com RENDEZVOUS (limitado)
-              lines = []
-              for i, line in enumerate(t.splitlines(), start=1):
-                  if "RENDEZVOUS" in line:
-                      lines.append((i, line.strip()))
-              if lines:
-                  hits.append((p, lines[:8]))  # até 8 linhas por arquivo
-
-          print(f"Found {len(hits)} .rs files containing 'RENDEZVOUS':")
-          for p, lines in hits:
-              print("----", p.as_posix())
-              for ln, txt in lines:
-                  # reduz tamanho pra não poluir log
-                  txt = re.sub(r'\s+', ' ', txt)
-                  print(f"{ln}: {txt[:200]}")
-          PY
             done
             exit 1
           fi
           head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
-       
+        shell: bash
 
-      - name: Patch RustDesk default server and key (auto-detect)
+      - name: Patch RustDesk defaults (server + key)
         shell: bash
         env:
           RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
@@ -227,98 +185,59 @@ jobs:
               print("Missing secrets RENDEZVOUS_SERVER or RS_PUB_KEY")
               sys.exit(1)
 
-          # Se o secret vier sem porta, assume 21116 (você pode trocar)
+          # Normaliza porta (se quiser outra porta, troque aqui)
           if ":" not in server:
               server = f"{server}:21116"
+          domain = server.split(":")[0]
 
-          repo = Path(".").resolve()
-
-          def find_files(pattern: str):
-              hits = []
-              for p in repo.rglob("*.rs"):
-                  try:
-                      t = p.read_text(encoding="utf-8", errors="ignore")
-                  except Exception:
-                      continue
-                  if pattern in t:
-                      hits.append(p)
-              return hits
-
-          rs_files = find_files("RS_PUB_KEY")
-          rdz_files = [p for p in find_files("RENDEZVOUS") if "target" not in str(p)]
-
-          if not rs_files:
-              print("Could not find RS_PUB_KEY in any .rs file")
-              sys.exit(1)
-
-          if not rdz_files:
-              print("Could not find RENDEZVOUS in any .rs file")
-              sys.exit(1)
-
-          print("RS_PUB_KEY candidates:", len(rs_files))
-          print("RENDEZVOUS candidates:", len(rdz_files))
-
-          # Regexes mais amplas (cobrem pub const/static, com ou sem type)
-          pubkey_patterns = [
-              # RS_PUB_KEY = "....";
-              (re.compile(r'(RS_PUB_KEY\s*=\s*)"[^"]*"\s*;'), r'\1"' + key + r'";'),
-              # pub const RS_PUB_KEY: &str = "....";
-              (re.compile(r'(RS_PUB_KEY\s*:\s*&str\s*=\s*)"[^"]*"\s*;'), r'\1"' + key + r'";'),
-              # pub static ref RS_PUB_KEY: String = "....".to_string();
-              (re.compile(r'(RS_PUB_KEY[^\n=]*=\s*)"[^"]*"\s*(\.to_string\(\))?\s*;'), r'\1"' + key + r'"\2;'),
-          ]
-
-          # Rendezvous pode ser string simples, ou array de &str
-          rendezvous_patterns = [
-              # RENDEZVOUS_SERVER = "host:port";
-              (re.compile(r'(RENDEZVOUS[_A-Z]*SERVER\s*=\s*)"[^"]*"\s*;'), r'\1"' + server + r'";'),
-              # RENDEZVOUS_SERVERS = ["a:21116", "b:21116"];
-              (re.compile(r'(RENDEZVOUS[_A-Z]*SERVERS\s*=\s*\[)[^\]]*(\]\s*;)'), r'\1"' + server + r'"\2'),
-              # pub const RENDEZVOUS_SERVERS: [&str; N] = ["..."];
-              (re.compile(r'(RENDEZVOUS[_A-Z]*SERVERS[^\n=]*=\s*\[)[^\]]*(\]\s*;)'), r'\1"' + server + r'"\2'),
-          ]
-
-          def patch_file(path: Path, patterns):
-              text = path.read_text(encoding="utf-8", errors="ignore")
-              orig = text
-              for rx, repl in patterns:
-                  text = rx.sub(repl, text)
-              if text != orig:
-                  path.write_text(text, encoding="utf-8")
-                  return True
-              return False
-
-          changed = []
-
-          # Patch pubkey primeiro (normalmente 1 arquivo)
+          # 1) Patch da chave pública: procura e substitui RS_PUB_KEY em arquivos .rs
+          rs_files = list(Path(".").rglob("*.rs"))
+          key_patched = False
           for p in rs_files:
-              if patch_file(p, pubkey_patterns):
-                  changed.append(("RS_PUB_KEY", p))
+              t = p.read_text(encoding="utf-8", errors="ignore")
+              t2 = re.sub(r'(RS_PUB_KEY\s*=\s*)"[^"]*"\s*;', rf'\1"{key}";', t)
+              if t2 != t:
+                  p.write_text(t2, encoding="utf-8")
+                  key_patched = True
 
-          # Patch rendezvous (pode estar em outro arquivo)
-          for p in rdz_files:
-              if patch_file(p, rendezvous_patterns):
-                  changed.append(("RENDEZVOUS", p))
-
-          if not any(k == "RS_PUB_KEY" for k, _ in changed):
-              print("Patch failed: RS_PUB_KEY patterns did not match in any candidate file.")
-              print("Tip: open the file(s) listed above and check how RS_PUB_KEY is defined.")
+          if not key_patched:
+              print("RS_PUB_KEY not patched (pattern not found).")
               sys.exit(1)
 
-          if not any(k == "RENDEZVOUS" for k, _ in changed):
-              print("Patch failed: RENDEZVOUS patterns did not match in any candidate file.")
-              print("Tip: open the file(s) listed above and check how rendezvous server(s) is defined.")
+          # 2) Patch do servidor: fallback robusto
+          # Substitui qualquer host rustdesk.com (e subdomínios) pelo seu domínio,
+          # e quando existir string com :21116, troca pelo seu server completo.
+          exts = {".rs",".dart",".toml",".json",".yaml",".yml"}
+          server_patched = 0
+
+          for p in Path(".").rglob("*"):
+              if not p.is_file() or p.suffix.lower() not in exts:
+                  continue
+              t = p.read_text(encoding="utf-8", errors="ignore")
+              orig = t
+
+              # troca "xxxx.rustdesk.com:21116" -> "meu.dominio:21116"
+              t = re.sub(r'([a-zA-Z0-9\.-]*\.)?rustdesk\.com:21116', server, t)
+              # troca "xxxx.rustdesk.com" -> "meu.dominio"
+              t = re.sub(r'([a-zA-Z0-9\.-]*\.)?rustdesk\.com', domain, t)
+
+              if t != orig:
+                  p.write_text(t, encoding="utf-8")
+                  server_patched += 1
+
+          if server_patched == 0:
+              print("Server not patched (no rustdesk.com occurrences found).")
               sys.exit(1)
 
-          print("Patched successfully:")
-          for kind, p in changed:
-              print(f" - {kind}: {p}")
+          print("Patched OK. Domain:", domain)
           PY
+
       - name: Build rustdesk
-        shell: bash
         run: |
+          # Windows: build RustDesk (PowerShell default)
           python3 .\build.py --portable --hwcodec --flutter --vram --skip-portable-pack
           mv ./flutter/build/windows/x64/runner/Release ./rustdesk
+
           # Download usbmmidd_v2.zip and extract it to ./rustdesk
           Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
           Expand-Archive usbmmidd_v2.zip -DestinationPath .
@@ -332,27 +251,22 @@ jobs:
             Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/printer_driver_adapter.zip -OutFile printer_driver_adapter.zip
             Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/sha256sums -OutFile sha256sums
 
-            # Check and move the files
             $checksum_driver = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*rustdesk_printer_driver_v4-1.4\.zip$').Matches.Groups[1].Value
             $downloadsum_driver = Get-FileHash -Path rustdesk_printer_driver_v4-1.4.zip -Algorithm SHA256
             $checksum_adapter = (Select-String -Path .\sha256sums -Pattern '^([a-fA-F0-9]{64}) \*printer_driver_adapter\.zip$').Matches.Groups[1].Value
             $downloadsum_adapter = Get-FileHash -Path printer_driver_adapter.zip -Algorithm SHA256
+
             if ($checksum_driver -eq $downloadsum_driver.Hash -and $checksum_adapter -eq $downloadsum_adapter.Hash) {
-                Write-Output "rustdesk_printer_driver_v4-1.4, checksums match, extract the file."
+                Write-Output "Checksums match, extracting printer driver."
                 Expand-Archive rustdesk_printer_driver_v4-1.4.zip -DestinationPath .
                 mkdir ./rustdesk/drivers
                 mv -Force .\rustdesk_printer_driver_v4-1.4 ./rustdesk/drivers/RustDeskPrinterDriver
                 Expand-Archive printer_driver_adapter.zip -DestinationPath .
                 mv -Force .\printer_driver_adapter.dll ./rustdesk
-            } elseif ($checksum_driver -ne $downloadsum_driver.Hash) {
-                Write-Output "rustdesk_printer_driver_v4-1.4, checksums do not match, ignore the file."
-            } else {
-                Write-Output "printer_driver_adapter.dll, checksums do not match, ignore the file."
             }
           } catch {
-              Write-Host "Ingore the printer driver error."
+              Write-Host "Ignore the printer driver error."
           }
-
       - name: find Runner.res
         # Windows: find Runner.res (compiled from ./flutter/windows/runner/Runner.rc), copy to ./Runner.res
         # Runner.rc does not contain actual version, but Runner.res does
